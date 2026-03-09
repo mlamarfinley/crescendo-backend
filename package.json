@@ -1,0 +1,30 @@
+{
+  "name": "crescendo-backend",
+  "version": "1.0.0",
+  "description": "Crescendo outreach backend - Typeform intake + email sequences",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "ts-node src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate deploy"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.0.0",
+    "express": "^4.18.2",
+    "dotenv": "^16.3.1",
+    "node-cron": "^3.0.2",
+    "nodemailer": "^6.9.4",
+    "axios": "^1.5.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.17",
+    "@types/node": "^20.4.5",
+    "@types/node-cron": "^3.0.8",
+    "@types/nodemailer": "^6.4.9",
+    "prisma": "^5.0.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.1.6"
+  }
+}
