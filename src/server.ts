@@ -2,6 +2,7 @@ import express from 'express';
 import { PrismaClient } from '@prisma/client';
 import dotenv from 'dotenv';
 import nodemailer from 'nodemailer';
+import OpenAI from 'openai';
 
 dotenv.config();
 
@@ -21,6 +22,92 @@ const transporter = nodemailer.createTransport({
     pass: process.env.EMAIL_PASS,
   },
 });
+
+// OpenAI client (only if key exists)
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+
+// Extract readable answers from Typeform payload
+function extractFormSummary(answers: any[]): string {
+  return answers.map((a: any) => {
+    const q = a.field?.ref || 'unknown';
+    let val = '';
+    if (a.type === 'text' || a.type === 'short_text') val = a.text;
+    else if (a.type === 'email') val = a.email;
+    else if (a.type === 'choice') val = a.choice?.label;
+    else if (a.type === 'choices') val = a.choices?.labels?.join(', ');
+    else if (a.type === 'number') val = String(a.number);
+    else if (a.type === 'long_text') val = a.text;
+    else val = JSON.stringify(a);
+    const title = a.field?.title || q;
+    return `${title}: ${val}`;
+  }).join('\n');
+}
+
+// Generate personalized email using OpenAI
+async function generatePersonalizedEmail(
+  firstName: string,
+  company: string,
+  formSummary: string
+): Promise<{ subject: string; body: string }> {
+  if (!openai) {
+    return getFallbackEmail(firstName);
+  }
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        {
+          role: 'system',
+          content: `You are a copywriter for Third Eye Consultancy, a premium consultancy that helps artists, brands, venues, and enterprises with creative strategy, AI automation, marketing, and event production.
+
+Brand voice: confident, visionary, sharp, warm but professional. You see what others miss. Tagline: "Let's see further together."
+
+Write a personalized outreach confirmation email to a new lead who just submitted an intake form. The email should:
+- Address them by first name
+- Reference their specific company/organization if provided
+- Acknowledge their industry, goals, priorities, and pain points based on their form answers
+- Briefly hint at how Third Eye can specifically help THEM (not generic services)
+- Be concise (3-4 short paragraphs max)
+- End with a note that a team member will reach out within 24-48 hours
+- Do NOT include a subject line in the body
+- Do NOT use placeholder brackets like [Name]
+- Sound human, not robotic
+
+Respond in JSON format:
+{"subject": "...", "body": "..."}
+
+The body should be plain text (no HTML). Keep it under 200 words.`
+        },
+        {
+          role: 'user',
+          content: `New lead submission:\n\nName: ${firstName}\nCompany: ${company || 'Not provided'}\n\nForm answers:\n${formSummary}`
+        }
+      ],
+      temperature: 0.8,
+      max_tokens: 500,
+    });
+
+    const raw = completion.choices[0]?.message?.content || '';
+    const parsed = JSON.parse(raw);
+    return {
+      subject: parsed.subject || 'We see you \u2014 Third Eye Consultancy',
+      body: parsed.body || '',
+    };
+  } catch (err) {
+    console.error('OpenAI generation failed, using fallback:', err);
+    return getFallbackEmail(firstName);
+  }
+}
+
+function getFallbackEmail(firstName: string) {
+  return {
+    subject: 'We see you \u2014 Third Eye Consultancy',
+    body: `Hey ${firstName || 'there'},\n\nThank you for reaching out to Third Eye Consultancy. We received your intake form and are reviewing your details now.\n\nA member of our team will be in touch within 24\u201348 hours to discuss next steps.\n\nIn the meantime, feel free to reply to this email with any additional details about your project.\n\nThird Eye Consultancy \u2014 Let\u2019s see further together.`
+  };
+}
 
 // Health check
 app.get('/health', (req, res) => {
@@ -72,25 +159,32 @@ app.post('/webhooks/typeform', async (req, res) => {
 
     console.log(`Lead created/updated: ${lead.id} (${lead.email})`);
 
-    // Send confirmation email
+    // Generate personalized email with AI
+    const formSummary = extractFormSummary(answers);
+    const emailContent = await generatePersonalizedEmail(
+      lead.firstName || '',
+      data.company || '',
+      formSummary
+    );
+
+    // Send personalized email
     try {
       await transporter.sendMail({
         from: `"Third Eye Consultancy" <${process.env.EMAIL_FROM}>`,
         to: lead.email,
-        subject: 'We see you — Third Eye Consultancy',
+        subject: emailContent.subject,
         html: `
-          <div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; background: #3B0764; color: #E8EAF6; padding: 40px; border-radius: 12px;">
-            <h1 style="color: #ffffff;">Welcome, ${lead.firstName || 'there'}.</h1>
-            <p style="font-size: 16px; line-height: 1.6;">Thank you for reaching out to Third Eye Consultancy. We received your intake form and a member of our team will be in touch within 24–48 hours.</p>
-            <p style="font-size: 16px; line-height: 1.6;">In the meantime, feel free to reply to this email with any additional details about your project.</p>
-            <hr style="border: 1px solid #5B21B6; margin: 24px 0;" />
-            <p style="font-size: 14px; color: #A78BFA;">Third Eye Consultancy — Let's see further together.</p>
+          <div style="font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #3B0764; color: #E8EAF6; padding: 40px; border-radius: 12px;">
+            <h2 style="color: #ffffff; margin-bottom: 24px; font-weight: 600;">${emailContent.subject}</h2>
+            <div style="font-size: 15px; line-height: 1.8; white-space: pre-line;">${emailContent.body}</div>
+            <hr style="border: 1px solid #5B21B6; margin: 28px 0;" />
+            <p style="font-size: 13px; color: #A78BFA; margin: 0;">Third Eye Consultancy \u2014 Let's see further together.</p>
           </div>
         `,
       });
-      console.log(`Confirmation email sent to ${lead.email}`);
+      console.log(`Personalized email sent to ${lead.email}`);
     } catch (emailErr) {
-      console.error('Failed to send confirmation email:', emailErr);
+      console.error('Failed to send email:', emailErr);
     }
 
     res.json({ success: true, leadId: lead.id });
