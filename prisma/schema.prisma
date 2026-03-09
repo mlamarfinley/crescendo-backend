@@ -1,0 +1,100 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Lead {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  email       String   @unique
+  firstName   String?
+  lastName    String?
+  phone       String?
+  company     String?
+  source      String   @default("typeform")
+  status      LeadStatus @default(NEW)
+  tags        String[]
+  formData    Json?
+  sequences   LeadSequence[]
+  emails      EmailLog[]
+}
+
+model Campaign {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  name        String
+  description String?
+  status      CampaignStatus @default(DRAFT)
+  steps       SequenceStep[]
+  leads       LeadSequence[]
+}
+
+model SequenceStep {
+  id          String   @id @default(cuid())
+  campaignId  String
+  campaign    Campaign @relation(fields: [campaignId], references: [id])
+  stepNumber  Int
+  delayDays   Int      @default(0)
+  subject     String
+  bodyTemplate String
+  createdAt   DateTime @default(now())
+}
+
+model LeadSequence {
+  id          String   @id @default(cuid())
+  leadId      String
+  lead        Lead     @relation(fields: [leadId], references: [id])
+  campaignId  String
+  campaign    Campaign @relation(fields: [campaignId], references: [id])
+  currentStep Int      @default(0)
+  status      SequenceStatus @default(ACTIVE)
+  nextSendAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model EmailLog {
+  id          String   @id @default(cuid())
+  leadId      String
+  lead        Lead     @relation(fields: [leadId], references: [id])
+  subject     String
+  body        String
+  status      EmailStatus @default(PENDING)
+  sentAt      DateTime?
+  createdAt   DateTime @default(now())
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  CONVERTED
+  UNSUBSCRIBED
+}
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+enum SequenceStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  UNSUBSCRIBED
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+  OPENED
+}
