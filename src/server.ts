@@ -1,7 +1,6 @@
 import express from 'express';
 import { PrismaClient } from '@prisma/client';
 import dotenv from 'dotenv';
-import nodemailer from 'nodemailer';
 import OpenAI from 'openai';
 
 dotenv.config();
@@ -12,19 +11,82 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Email transporter
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST,
-  port: Number(process.env.EMAIL_PORT) || 587,
-  secure: false,
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
+// Resend API for email (Railway blocks SMTP)
+async function sendEmail(to: string, subject: string, html: string) {
+  const RESEND_API_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_API_KEY) {
+    console.error('RESEND_API_KEY not set, skipping email');
+    return;
+  }
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: process.env.EMAIL_FROM || 'Third Eye Consultancy <onboarding@resend.dev>',
+      to: [to],
+      subject,
+      html,
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Resend error: ${JSON.stringify(data)}`);
+  }
+  return data;
+}
 
-// OpenAI client (only if key exists)
-const openai = process.env.OPENAI_API_KEY
+// Twilio SMS/WhatsApp
+async function sendSMS(to: string, body: string) {
+  const SID = process.env.TWILIO_ACCOUNT_SID;
+  const TOKEN = process.env.TWILIO_AUTH_TOKEN;
+  const FROM = process.env.TWILIO_PHONE_NUMBER;
+  if (!SID || !TOKEN || !FROM) {
+    console.log('Twilio not configured, skipping SMS');
+    return;
+  }
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${SID}/Messages.json`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(`${SID}:${TOKEN}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ To: to, From: FROM, Body: body }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Twilio SMS error: ${JSON.stringify(data)}`);
+  console.log(`SMS sent to ${to}`);
+  return data;
+}
+
+async function sendWhatsApp(to: string, body: string) {
+  const SID = process.env.TWILIO_ACCOUNT_SID;
+  const TOKEN = process.env.TWILIO_AUTH_TOKEN;
+  const FROM = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+14155238886';
+  if (!SID || !TOKEN) {
+    console.log('Twilio not configured, skipping WhatsApp');
+    return;
+  }
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${SID}/Messages.json`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': 'Basic ' + Buffer.from(`${SID}:${TOKEN}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({ To: `whatsapp:${to}`, From: FROM, Body: body }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(`Twilio WhatsApp error: ${JSON.stringify(data)}`);
+  console.log(`WhatsApp sent to ${to}`);
+  return data;
+}
+
+// OpenAI client (only if key exists and not placeholder)
+const openai = process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'YOUR_KEY_HERE'
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
 
@@ -54,7 +116,6 @@ async function generatePersonalizedEmail(
   if (!openai) {
     return getFallbackEmail(firstName);
   }
-
   try {
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -62,9 +123,7 @@ async function generatePersonalizedEmail(
         {
           role: 'system',
           content: `You are a copywriter for Third Eye Consultancy, a premium consultancy that helps artists, brands, venues, and enterprises with creative strategy, AI automation, marketing, and event production.
-
 Brand voice: confident, visionary, sharp, warm but professional. You see what others miss. Tagline: "Let's see further together."
-
 Write a personalized outreach confirmation email to a new lead who just submitted an intake form. The email should:
 - Address them by first name
 - Reference their specific company/organization if provided
@@ -75,10 +134,8 @@ Write a personalized outreach confirmation email to a new lead who just submitte
 - Do NOT include a subject line in the body
 - Do NOT use placeholder brackets like [Name]
 - Sound human, not robotic
-
 Respond in JSON format:
 {"subject": "...", "body": "..."}
-
 The body should be plain text (no HTML). Keep it under 200 words.`
         },
         {
@@ -89,7 +146,6 @@ The body should be plain text (no HTML). Keep it under 200 words.`
       temperature: 0.8,
       max_tokens: 500,
     });
-
     const raw = completion.choices[0]?.message?.content || '';
     const parsed = JSON.parse(raw);
     return {
@@ -146,6 +202,16 @@ app.post('/webhooks/typeform', async (req, res) => {
       }
     }
 
+    // Also try to get phone from answers
+    let phone = '';
+    for (const answer of answers) {
+      if (answer.type === 'phone_number') {
+        phone = answer.phone_number;
+        break;
+      }
+    }
+    if (phone) data.phone = phone;
+
     if (!data.email) {
       return res.status(400).json({ error: 'No email found in submission' });
     }
@@ -153,7 +219,7 @@ app.post('/webhooks/typeform', async (req, res) => {
     // Upsert lead
     const lead = await prisma.lead.upsert({
       where: { email: data.email },
-      update: { formData: data.formData },
+      update: { formData: data.formData, phone: phone || undefined },
       create: data,
     });
 
@@ -167,24 +233,39 @@ app.post('/webhooks/typeform', async (req, res) => {
       formSummary
     );
 
-    // Send personalized email
+    // Send personalized email via Resend API
     try {
-      await transporter.sendMail({
-        from: `"Third Eye Consultancy" <${process.env.EMAIL_FROM}>`,
-        to: lead.email,
-        subject: emailContent.subject,
-        html: `
-          <div style="font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #3B0764; color: #E8EAF6; padding: 40px; border-radius: 12px;">
-            <h2 style="color: #ffffff; margin-bottom: 24px; font-weight: 600;">${emailContent.subject}</h2>
-            <div style="font-size: 15px; line-height: 1.8; white-space: pre-line;">${emailContent.body}</div>
-            <hr style="border: 1px solid #5B21B6; margin: 28px 0;" />
-            <p style="font-size: 13px; color: #A78BFA; margin: 0;">Third Eye Consultancy \u2014 Let's see further together.</p>
-          </div>
-        `,
-      });
-      console.log(`Personalized email sent to ${lead.email}`);
+      await sendEmail(
+        lead.email,
+        emailContent.subject,
+        `
+        <div style="font-family: 'Helvetica Neue', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #3B0764; color: #E8EAF6; padding: 40px; border-radius: 12px;">
+          <h2 style="color: #ffffff; margin-bottom: 24px; font-weight: 600;">${emailContent.subject}</h2>
+          <div style="font-size: 15px; line-height: 1.8; white-space: pre-line;">${emailContent.body}</div>
+          <hr style="border: 1px solid #5B21B6; margin: 28px 0;" />
+          <p style="font-size: 13px; color: #A78BFA; margin: 0;">Third Eye Consultancy \u2014 Let's see further together.</p>
+        </div>
+        `
+      );
+      console.log(`Email sent to ${lead.email}`);
     } catch (emailErr) {
       console.error('Failed to send email:', emailErr);
+    }
+
+    // Send SMS notification if phone provided
+    if (phone) {
+      try {
+        await sendSMS(phone, `Hey ${lead.firstName || 'there'}! Third Eye Consultancy here. We got your intake form and a team member will reach out within 24-48 hours. Reply STOP to opt out.`);
+      } catch (smsErr) {
+        console.error('Failed to send SMS:', smsErr);
+      }
+
+      // Send WhatsApp notification
+      try {
+        await sendWhatsApp(phone, `Hey ${lead.firstName || 'there'}! \u{1F441} Third Eye Consultancy here. We received your submission and are reviewing it now. A team member will be in touch within 24-48 hours. Let's see further together.`);
+      } catch (waErr) {
+        console.error('Failed to send WhatsApp:', waErr);
+      }
     }
 
     res.json({ success: true, leadId: lead.id });
